@@ -1,0 +1,196 @@
+import sys
+import os
+import glob
+import time
+import math
+import shutil
+
+import ij
+from ij import IJ
+
+from loci.formats import ImageReader,ImageWriter
+from loci.formats import MetadataTools
+from loci.common import RandomAccessInputStream
+from loci.common import RandomAccessOutputStream
+from loci.formats.tiff import TiffSaver
+
+from ome.xml.model.enums import DimensionOrder
+from ome.xml.model.primitives import PositiveInteger
+
+def delete_slices(slices_dir):
+    try:
+        for name in glob.glob("%s/img*"%slices_dir):
+            os.remove(name)
+    except:
+        pass
+        
+def fused_size_info(meta):
+    szeX = meta.getPixelsSizeX(0)
+    szeY = meta.getPixelsSizeY(0)
+    return szeX,szeY 
+    
+def write_fused(output_path,channels,physX,physY,physZ,sizeZ,pixType):
+
+    # number of slices will determine filename format
+    digits = "00"
+    if sizeZ < 100:
+        digits = "0"
+    if sizeZ < 10:
+        digits = ""
+    sizeC = len(channels)
+
+    # determine the number of subsets that need to be written
+    slices_per_subset = 200
+
+    num_output_files = divmod(sizeZ,slices_per_subset)
+    fpaths = []
+    if num_output_files[0] == 0:
+        nslices = [sizeZ]
+        num_output_files = 1
+        #fpaths.append("%s/fused_C%s.ome.tif"%(output_path,str(theC-1)))
+        fpaths.append("%s/fused.ome.tif"%output_path)
+    else:
+        nslices = []
+        for n in range(num_output_files[0]):
+            nslices.append(slices_per_subset)
+
+        if num_output_files[1] > 0:
+            nslices.append(num_output_files[1])        
+        
+        for s in range(len(nslices)):
+            fpaths.append("%s/fused_subset%s.ome.tif"%(output_path,str(s)))
+
+    first_fused = output_path+"/img_t1_z%s%s_c%s"%(digits,str(1),str(1))
+    fused_metadata = MetadataTools.createOMEXMLMetadata()
+    reader = get_reader(first_fused,fused_metadata)
+    reader.close()
+    sizeX,sizeY = fused_size_info(fused_metadata)
+
+    # make ome-xml metadata
+    meta = MetadataTools.createOMEXMLMetadata()
+    
+    # set minimal metadata
+    meta.setImageID("Image:0", 0)
+    meta.setPixelsID("Pixels:0", 0)
+    meta.setPixelsBinDataBigEndian(True,0,0)
+    meta.setPixelsDimensionOrder(DimensionOrder.XYCZT,0)
+    meta.setPixelsType(pixType, 0)
+    meta.setPixelsPhysicalSizeX(physX,0)
+    meta.setPixelsPhysicalSizeY(physY,0)
+    meta.setPixelsPhysicalSizeZ(physZ,0)
+    meta.setPixelsSizeX(sizeX,0)
+    meta.setPixelsSizeY(sizeY,0)
+    meta.setPixelsSizeZ(PositiveInteger(sizeZ),0)
+    meta.setPixelsSizeC(PositiveInteger(sizeC),0)
+    meta.setPixelsSizeT(PositiveInteger(1),0) 
+    
+    for c,channel in enumerate(channels):
+
+        meta.setChannelID("Channel:0:" + str(c), 0, c)
+        spp = channel['spp']
+        meta.setChannelSamplesPerPixel(spp, 0, c)
+        name = channel['name']
+        color = channel['color']
+        meta.setChannelName(name,0,c)
+        meta.setChannelColor(color,0,c)
+        
+    # setup a writer
+    writer = ImageWriter()
+    writer.setCompression('LZW')
+    writer.setMetadataRetrieve(meta)
+    fpath = fpaths[0]
+    writer.setId(fpath)
+    
+    # write the slices, changing the output file when necessary
+    plane = 0
+    theZ = 0
+    for f in range(len(fpaths)):
+        meta.setImageName(os.path.basename(fpaths[f]),0)
+        writer.changeOutputFile(fpaths[f])
+        for s in range(nslices[f]):
+            for theC in range(sizeC):
+                print plane
+                fpath = output_path+"/img_t1_z%s%s_c%s"%(digits,str(theZ+1),str(theC+1))
+                if (len(digits) == 1) and (theZ+1 > 9):
+                    fpath = output_path+"/img_t1_z%s_c%s"%(str(theZ+1),str(theC+1))
+                if (len(digits) == 2) and (theZ+1 > 9):
+                    fpath = output_path+"/img_t1_z0%s_c%s"%(str(theZ+1),str(theC+1))
+                if (len(digits) == 2) and (theZ+1 > 99):
+                    fpath = output_path+"/img_t1_z%s_c%s"%(str(theZ+1),str(theC+1))
+                m = MetadataTools.createOMEXMLMetadata()
+                r = get_reader(fpath,m)
+                writer.saveBytes(plane,r.openBytes(0))
+                r.close()
+                plane += 1
+            theZ += 1
+    writer.close()
+    
+def run_stitching(args):
+    
+    IJ.run("Grid/Collection stitching", "type=[Grid: snake by rows] order=[Right & Down                ] "\\
+            "grid_size_x=%s grid_size_y=%s tile_overlap=%s first_file_index_i=0 "\\
+            "directory=[%s] file_names=[%s] "\\
+            "output_textfile_name=[%s] fusion_method=[%s] "\\
+            "regression_threshold=%s max/avg_displacement_threshold=%s "\\
+            "absolute_displacement_threshold=%s compute_overlap "\\
+            "computation_parameters=[Save memory (but be slower)] "\\
+            "image_output=[Write to disk] output_directory=[%s]"%args)
+            
+def pixel_info(meta):
+    physX = meta.getPixelsPhysicalSizeX(0)
+    physY = meta.getPixelsPhysicalSizeY(0)
+    physZ = meta.getPixelsPhysicalSizeZ(0)
+    pixType = meta.getPixelsType(0)
+    return physX,physY,physZ,pixType
+            
+def channel_info(meta):
+    sizeC = meta.getPixelsSizeC(0).getValue()
+    channels = []
+    for c in range(sizeC):
+        chan_d = dict()
+        chan_d['spp'] = meta.getChannelSamplesPerPixel(0,c)
+        chan_d['name'] = meta.getChannelName(0,c)
+        chan_d['color'] = meta.getChannelColor(0,c)
+        channels.append(chan_d)
+    return channels
+    
+def get_reader(file, complete_meta):
+    reader = ImageReader()
+    reader.setMetadataStore(complete_meta)
+    reader.setId(file)
+    return reader
+    
+def run_script():
+
+    results = "{0}"    
+    gridX = {1}
+    gridY = {2}
+    tile_overlap = {3}
+    input_dir = "/fiji/input"
+    fusion = "{4}"
+    reg_thresh = {5}
+    max_disp = {6}
+    abs_dip = {7}
+    output_dir = "/fiji/output"
+    sizeZ = {8}
+
+    tile_data = glob.glob("%s/*.ome.tif"%input_dir)
+    tile_metadata = MetadataTools.createOMEXMLMetadata()
+    reader = get_reader(tile_data[0],tile_metadata)
+    reader.close()
+
+    channels = channel_info(tile_metadata)
+    physX,physY,physZ,pixType = pixel_info(tile_metadata)
+
+    tile_names = "tile_{9}.ome.tif"
+    args = (gridX,gridY,tile_overlap,input_dir,tile_names, \\
+            results,fusion,reg_thresh,max_disp,\\
+            abs_dip,output_dir)
+    run_stitching(args)
+        
+    write_fused(output_dir,channels,physX,physY,physZ,sizeZ,pixType)
+
+    delete_slices(input_dir)
+    
+if __name__=='__main__':
+    run_script()
